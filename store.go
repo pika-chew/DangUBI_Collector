@@ -5,9 +5,45 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net"
+	"os"
+	"strconv"
 
 	"github.com/go-sql-driver/mysql"
 )
+
+func openDatabase() (*sql.DB, error) {
+	if dsn := os.Getenv("COLLECTOR_MYSQL_DSN"); dsn != "" {
+		db, err := sql.Open("mysql", dsn)
+		if err != nil {
+			return nil, errors.New("invalid COLLECTOR_MYSQL_DSN")
+		}
+		return db, nil
+	}
+
+	cfg := mysql.NewConfig()
+	cfg.Net = "tcp"
+	cfg.Addr = os.Getenv("COLLECTOR_MYSQL_ADDRESS")
+	cfg.DBName = os.Getenv("COLLECTOR_MYSQL_DATABASE")
+	cfg.User = os.Getenv("COLLECTOR_MYSQL_USER")
+	cfg.Passwd = os.Getenv("COLLECTOR_MYSQL_PASSWORD")
+	if cfg.Addr == "" || cfg.DBName == "" || cfg.User == "" || cfg.Passwd == "" {
+		return nil, errors.New("set COLLECTOR_MYSQL_DSN or all of COLLECTOR_MYSQL_ADDRESS, COLLECTOR_MYSQL_DATABASE, COLLECTOR_MYSQL_USER, and COLLECTOR_MYSQL_PASSWORD")
+	}
+	host, port, err := net.SplitHostPort(cfg.Addr)
+	if err != nil || host == "" {
+		return nil, errors.New("COLLECTOR_MYSQL_ADDRESS must use host:port")
+	}
+	portNumber, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || portNumber == 0 {
+		return nil, errors.New("COLLECTOR_MYSQL_ADDRESS requires a port from 1 to 65535")
+	}
+	connector, err := mysql.NewConnector(cfg)
+	if err != nil {
+		return nil, errors.New("invalid Collector MySQL configuration")
+	}
+	return sql.OpenDB(connector), nil
+}
 
 func saveRecord(ctx context.Context, db *sql.DB, event record, body []byte) error {
 	tx, err := db.BeginTx(ctx, nil)

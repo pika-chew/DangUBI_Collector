@@ -69,12 +69,41 @@ docker buildx imagetools inspect "$IMAGE"
 docker buildx create --name collector-builder --driver docker-container
 ```
 
-`0.1.0-local.1`은 검증용 예시 태그입니다. 컨테이너에서 워커를 실행하려면 `--worker`와 위 환경 변수를 전달합니다. 파일 적재를 실행하려면 JSONL을 마운트하고 입력 경로를 전달합니다. 두 모드 모두 `COLLECTOR_MYSQL_DSN`이 필요합니다.
+`0.1.0-local.1`은 검증용 예시 태그입니다. 컨테이너에서 워커를 실행하려면 `--worker`와 큐·버킷 설정을 전달합니다. 파일 적재를 실행하려면 JSONL을 마운트하고 입력 경로를 전달합니다. DB 연결은 두 모드 모두 `COLLECTOR_MYSQL_DSN` 또는 아래 네 환경 변수로 설정할 수 있습니다. DSN이 있으면 우선 사용합니다.
 
 ## Kubernetes 통합 검증
 
 테스트 배포에서는 컨테이너 인자를 `--worker`로 설정합니다. 운영 배포 전에는 실제 큐 메시지 형식과 레코드 고유 키, 운영 테이블과 outbox 이벤트 계약을 확인합니다.
 
-Deployment에는 큐 URL과 버킷을 지정하고 `sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:ChangeMessageVisibility`, `s3:GetObject`, `s3:GetObjectVersion` 권한을 부여합니다. DB는 MySQL Router의 쓰기 주소 `mysql-router.dangubi-data.svc.cluster.local:3306`과 DB 계정으로 연결합니다. GitOps의 Spring Actuator probe를 교체할 Go 헬스 체크는 별도 구현이 필요합니다.
+Deployment에는 큐 URL과 버킷을 지정하고 `sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:ChangeMessageVisibility`, `s3:GetObject`, `s3:GetObjectVersion` 권한을 부여합니다.
+
+- ConfigMap의 `COLLECTOR_MYSQL_ADDRESS`에는 MySQL Router 쓰기 주소 `mysql-router.dangubi-data.svc.cluster.local:3306`을, `COLLECTOR_MYSQL_DATABASE`에는 사용할 DB 이름을 지정합니다.
+- `COLLECTOR_MYSQL_USER`와 `COLLECTOR_MYSQL_PASSWORD`는 `collector-mysql-cred` Secret의 `username`과 `password` 키에서 가져옵니다. TLS 등 추가 드라이버 설정이 필요한 환경에서는 DSN을 Secret으로 전달합니다.
+
+워커의 헬스 체크는 기본 포트 `8080`에서 응답합니다. `COLLECTOR_HEALTH_ADDR`로 주소를 바꿀 수 있습니다. GitOps의 Spring Actuator 경로 대신 아래 설정을 컨테이너에 적용합니다.
+
+```yaml
+args: ["--worker"]
+ports:
+  - name: health
+    containerPort: 8080
+startupProbe:
+  httpGet:
+    path: /livez
+    port: health
+  periodSeconds: 5
+  failureThreshold: 30
+livenessProbe:
+  httpGet:
+    path: /livez
+    port: health
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: health
+  timeoutSeconds: 3
+```
+
+`/livez`는 HTTP 서버가 응답하면 `200`을 반환합니다. `/readyz`는 최근 SQS 수신 요청과 MySQL ping이 성공했을 때 `200`을, 그 외에는 `503`을 반환합니다. 빈 큐에서 수신 요청이 정상 종료돼도 성공입니다. S3 읽기 권한과 실제 적재는 테스트 이벤트로 확인합니다.
 
 그다음 새 고유 키로 테스트 입력을 한 건 보내 Pod 로그에서 수신과 처리를 확인하고, 그 키로 업무 테이블과 outbox를 조회합니다. SQS 메시지는 DB 커밋이 끝난 뒤 삭제되는지 확인합니다.

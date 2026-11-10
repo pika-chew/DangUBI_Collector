@@ -38,13 +38,9 @@ func run(ctx context.Context) error {
 	if len(os.Args) != 2 {
 		return errors.New("usage: collector <input.jsonl> | --worker")
 	}
-	dsn := os.Getenv("COLLECTOR_MYSQL_DSN")
-	if dsn == "" {
-		return errors.New("COLLECTOR_MYSQL_DSN is required")
-	}
-	db, err := sql.Open("mysql", dsn)
+	db, err := openDatabase()
 	if err != nil {
-		return errors.New("invalid COLLECTOR_MYSQL_DSN")
+		return err
 	}
 	defer db.Close()
 

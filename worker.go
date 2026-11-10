@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -69,12 +70,15 @@ func runWorker(ctx context.Context, db *sql.DB) error {
 			},
 		},
 	}
-	log.Print("collector worker started")
-	worker.poll(ctx)
-	return nil
+	healthAddr := os.Getenv("COLLECTOR_HEALTH_ADDR")
+	if healthAddr == "" {
+		healthAddr = ":8080"
+	}
+	return worker.serve(ctx, healthAddr, db.PingContext)
 }
 
-func (w queueWorker) poll(ctx context.Context) {
+func (w queueWorker) poll(ctx context.Context, queueReady *atomic.Bool) {
+	defer queueReady.Store(false)
 	for ctx.Err() == nil {
 		pollCtx, cancel := context.WithTimeout(ctx, pollCallTimeout)
 		result, err := w.queue.ReceiveMessage(pollCtx, &sqs.ReceiveMessageInput{
@@ -84,6 +88,7 @@ func (w queueWorker) poll(ctx context.Context) {
 			VisibilityTimeout:   visibilitySeconds,
 		})
 		cancel()
+		queueReady.Store(err == nil && ctx.Err() == nil)
 		if err != nil {
 			if ctx.Err() != nil {
 				return

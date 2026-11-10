@@ -13,4 +13,5 @@ FROM scratch
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /collector /collector
 USER 65532:65532
+EXPOSE 8080
 ENTRYPOINT ["/collector"]
