@@ -11,7 +11,9 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -25,32 +27,36 @@ type record struct {
 }
 
 func main() {
-	if err := run(); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func run() error {
+func run(ctx context.Context) error {
 	if len(os.Args) != 2 {
-		return errors.New("usage: go run . <input.jsonl>")
+		return errors.New("usage: collector <input.jsonl> | --worker")
 	}
 	dsn := os.Getenv("COLLECTOR_MYSQL_DSN")
 	if dsn == "" {
 		return errors.New("COLLECTOR_MYSQL_DSN is required")
 	}
-	input, err := os.Open(os.Args[1])
-	if err != nil {
-		return err
-	}
-	defer input.Close()
-
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return errors.New("invalid COLLECTOR_MYSQL_DSN")
 	}
 	defer db.Close()
 
-	return ingest(context.Background(), db, input)
+	if os.Args[1] == "--worker" {
+		return runWorker(ctx, db)
+	}
+	input, err := os.Open(os.Args[1])
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	return ingest(ctx, db, input)
 }
 
 func ingest(ctx context.Context, db *sql.DB, input io.Reader) error {
