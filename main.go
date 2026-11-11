@@ -17,6 +17,7 @@ import (
 	"time"
 )
 
+// record는 전처리된 JSONL 한 줄을 나타낸다. pld의 세부 구조는 종류별로 달라 JSON으로 보관한다.
 type record struct {
 	IdempotencyKey string          `json:"idempotencyKey"`
 	VehicleID      string          `json:"vehicleId"`
@@ -27,6 +28,7 @@ type record struct {
 }
 
 func main() {
+	// Ctrl+C나 Pod 종료 신호를 파일 처리와 SQS 워커에 취소로 전달한다.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx); err != nil {
@@ -35,6 +37,7 @@ func main() {
 }
 
 func run(ctx context.Context) error {
+	// os.Args[0]은 실행 파일 이름이므로 사용자가 주는 인자는 하나만 받는다.
 	if len(os.Args) != 2 {
 		return errors.New("usage: collector <input.jsonl> | --worker")
 	}
@@ -55,6 +58,7 @@ func run(ctx context.Context) error {
 	return ingest(ctx, db, input)
 }
 
+// ingest는 로컬 파일과 S3에서 압축을 해제한 스트림을 같은 방식으로 읽는다.
 func ingest(ctx context.Context, db *sql.DB, input io.Reader) error {
 	scanner := bufio.NewScanner(input)
 	scanner.Buffer(nil, 1<<20)
@@ -70,6 +74,7 @@ func ingest(ctx context.Context, db *sql.DB, input io.Reader) error {
 		if err != nil {
 			return fmt.Errorf("line %d: %w", line, err)
 		}
+		// 레코드별로 저장 시간을 제한하고, 다음 줄로 넘어가기 전에 타이머를 정리한다.
 		writeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		err = saveRecord(writeCtx, db, event, body)
 		cancel()
@@ -78,6 +83,7 @@ func ingest(ctx context.Context, db *sql.DB, input io.Reader) error {
 		}
 		processed++
 	}
+	// Scan은 입력 끝과 읽기 실패 모두에서 멈추므로 마지막에 오류를 확인한다.
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("read line %d: %w", line+1, err)
 	}
@@ -97,6 +103,7 @@ func parseRecord(body []byte) (record, error) {
 	if strings.TrimSpace(event.VehicleID) == "" || event.Timestamp <= 0 {
 		return record{}, errors.New("vehicleId and a positive ts are required")
 	}
+	// 전처리 스키마 버전 1의 Trip(3)과 Microtrip(4)을 적재한다.
 	if event.SchemaVersion != 1 || (event.Type != 3 && event.Type != 4) {
 		return record{}, errors.New("expected schemaVersion 1 and ty 3 or 4")
 	}

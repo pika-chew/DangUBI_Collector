@@ -21,6 +21,7 @@ const objectEvent = `{"eventVersion":"2.1","eventSource":"aws:s3","eventName":"O
 	"s3":{"bucket":{"name":"test-bucket"},"object":{"key":"firehose%2Fprocessed%2Ftest+file.jsonl.gz","versionId":"v1"}}}`
 
 func TestWorkerDeletesOnlyAfterAllObjectsAreProcessed(t *testing.T) {
+	// 모의 클라이언트로 객체 읽기, 저장, 메시지 삭제의 순서를 확인한다.
 	for _, test := range []struct {
 		name        string
 		body        string
@@ -91,6 +92,7 @@ func TestWorkerCancelsProcessingWhenVisibilityCannotBeExtended(t *testing.T) {
 		input: s3Input{
 			bucket: "test-bucket",
 			client: testObject(func(ctx context.Context, _ *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
+				// 읽기가 진행 중일 때 연장 실패가 취소 신호로 전달되는지 확인한다.
 				<-ctx.Done()
 				return nil, ctx.Err()
 			}),

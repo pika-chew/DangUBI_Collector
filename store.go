@@ -13,6 +13,7 @@ import (
 )
 
 func openDatabase() (*sql.DB, error) {
+	// DSN을 주면 TLS 같은 드라이버 옵션까지 지정할 수 있다. 나머지 환경 변수보다 우선한다.
 	if dsn := os.Getenv("COLLECTOR_MYSQL_DSN"); dsn != "" {
 		db, err := sql.Open("mysql", dsn)
 		if err != nil {
@@ -21,6 +22,7 @@ func openDatabase() (*sql.DB, error) {
 		return db, nil
 	}
 
+	// 주소와 계정을 드라이버에 따로 넘겨 비밀번호의 특수문자를 그대로 전달한다.
 	cfg := mysql.NewConfig()
 	cfg.Net = "tcp"
 	cfg.Addr = os.Getenv("COLLECTOR_MYSQL_ADDRESS")
@@ -45,11 +47,13 @@ func openDatabase() (*sql.DB, error) {
 	return sql.OpenDB(connector), nil
 }
 
+// saveRecord는 업무 데이터와 outbox를 한 트랜잭션으로 저장한다.
 func saveRecord(ctx context.Context, db *sql.DB, event record, body []byte) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
+	// 도중에 반환하면 롤백한다. 커밋을 마친 트랜잭션에는 영향이 없다.
 	defer tx.Rollback()
 
 	_, err = tx.ExecContext(ctx, `
@@ -58,7 +62,7 @@ func saveRecord(ctx context.Context, db *sql.DB, event record, body []byte) erro
 		event.IdempotencyKey, event.VehicleID, event.Timestamp, event.Type, string(event.Payload),
 	)
 	if err != nil {
-		// This insert has one unique key. A previous commit already wrote both rows.
+		// 업무 테이블의 유일 키가 중복이면 이전 트랜잭션에서 outbox까지 함께 저장된 것으로 본다.
 		var mysqlErr *mysql.MySQLError
 		if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 {
 			return nil
@@ -66,6 +70,7 @@ func saveRecord(ctx context.Context, db *sql.DB, event record, body []byte) erro
 		return fmt.Errorf("insert collector event: %w", err)
 	}
 
+	// outbox에는 pld 외에 차량 ID와 이벤트 시각도 포함된 전체 레코드를 남긴다.
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO outbox (id, aggregatetype, aggregateid, type, payload)
 		VALUES (?, ?, ?, ?, ?)`,

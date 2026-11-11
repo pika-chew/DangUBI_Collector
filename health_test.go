@@ -9,6 +9,7 @@ import (
 )
 
 func TestWorkerHealthSeparatesLivenessAndReadiness(t *testing.T) {
+	// SQS나 MySQL을 쓸 수 없어도 liveness는 성공하고 readiness만 실패해야 한다.
 	for _, test := range []struct {
 		name       string
 		queueReady bool
