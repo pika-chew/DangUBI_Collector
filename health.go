@@ -14,7 +14,7 @@ import (
 type workerHealth struct {
 	// 폴링 루프와 HTTP 핸들러가 동시에 접근하는 상태라 atomic.Bool을 사용한다.
 	queueReady atomic.Bool
-	pingDB     func(context.Context) error
+	checkSwift func(context.Context) error
 }
 
 func (h *workerHealth) handler() http.Handler {
@@ -30,8 +30,8 @@ func (h *workerHealth) handler() http.Handler {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
-		if h.pingDB(ctx) != nil {
-			http.Error(w, "MySQL is not ready", http.StatusServiceUnavailable)
+		if h.checkSwift(ctx) != nil {
+			http.Error(w, "Swift is not ready", http.StatusServiceUnavailable)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
@@ -39,12 +39,12 @@ func (h *workerHealth) handler() http.Handler {
 	return mux
 }
 
-func (w queueWorker) serve(ctx context.Context, address string, pingDB func(context.Context) error) error {
+func (w queueWorker) serve(ctx context.Context, address string, checkSwift func(context.Context) error) error {
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		return fmt.Errorf("listen for health checks: %w", err)
 	}
-	health := workerHealth{pingDB: pingDB}
+	health := workerHealth{checkSwift: checkSwift}
 	server := &http.Server{
 		Handler:           health.handler(),
 		ReadHeaderTimeout: 2 * time.Second,

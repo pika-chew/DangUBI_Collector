@@ -2,10 +2,8 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"sync/atomic"
@@ -42,7 +40,7 @@ type queueWorker struct {
 	refresh  time.Duration
 }
 
-func runWorker(ctx context.Context, db *sql.DB) error {
+func runWorker(ctx context.Context) error {
 	queueURL := os.Getenv("COLLECTOR_SQS_QUEUE_URL")
 	bucket := os.Getenv("COLLECTOR_S3_BUCKET")
 	if queueURL == "" || bucket == "" {
@@ -55,30 +53,33 @@ func runWorker(ctx context.Context, db *sql.DB) error {
 	if cfg.Region == "" {
 		return errors.New("set AWS_REGION or configure a region in the AWS profile")
 	}
-	// 큐에서 메시지를 가져오기 전에 MySQL에 연결할 수 있는지 확인한다.
-	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	err = db.PingContext(pingCtx)
+	// 큐에서 메시지를 받기 전에 Swift 인증과 대상 컨테이너 접근을 확인한다.
+	startupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	destination, err := openSwift(startupCtx)
+	if err != nil {
+		return err
+	}
+	err = destination.check(startupCtx)
 	cancel()
 	if err != nil {
-		return fmt.Errorf("connect to MySQL: %w", err)
+		return err
 	}
 	worker := queueWorker{
 		queue:    sqs.NewFromConfig(cfg),
 		queueURL: queueURL,
 		refresh:  visibilityRefresh,
 		input: s3Input{
-			client: s3.NewFromConfig(cfg),
-			bucket: bucket,
-			ingest: func(ctx context.Context, input io.Reader) error {
-				return ingest(ctx, db, input)
-			},
+			client:      s3.NewFromConfig(cfg),
+			bucket:      bucket,
+			destination: destination,
 		},
 	}
 	healthAddr := os.Getenv("COLLECTOR_HEALTH_ADDR")
 	if healthAddr == "" {
 		healthAddr = ":8080"
 	}
-	return worker.serve(ctx, healthAddr, db.PingContext)
+	return worker.serve(ctx, healthAddr, destination.check)
 }
 
 func (w queueWorker) poll(ctx context.Context, queueReady *atomic.Bool) {
@@ -141,7 +142,7 @@ func (w queueWorker) handle(ctx context.Context, message types.Message) error {
 		return err
 	}
 
-	// 알림에 포함된 객체를 모두 처리하고 DB 저장이 끝난 뒤에만 SQS에서 삭제한다.
+	// 알림에 포함된 객체를 모두 Swift에 저장한 뒤에만 SQS에서 삭제한다.
 	deleteCtx, cancel := context.WithTimeout(ctx, queueCallTimeout)
 	defer cancel()
 	_, err = w.queue.DeleteMessage(deleteCtx, &sqs.DeleteMessageInput{

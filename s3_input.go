@@ -1,8 +1,10 @@
 package main
 
 import (
-	"compress/gzip"
+	"bufio"
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,10 +21,14 @@ type objectClient interface {
 	GetObject(context.Context, *s3.GetObjectInput, ...func(*s3.Options)) (*s3.GetObjectOutput, error)
 }
 
+type objectDestination interface {
+	put(ctx context.Context, key, sourceID string, body io.Reader, size int64) error
+}
+
 type s3Input struct {
-	client objectClient
-	bucket string
-	ingest func(context.Context, io.Reader) error
+	client      objectClient
+	bucket      string
+	destination objectDestination
 }
 
 // s3Notification은 SQS 본문에 들어오는 S3 알림 형식이다. 알림에는 객체 위치가 담긴다.
@@ -78,24 +84,40 @@ func (input s3Input) process(ctx context.Context, body string) error {
 		} else if object.ETag != "" {
 			request.IfMatch = aws.String(strconv.Quote(object.ETag))
 		}
-		if err := input.readObject(ctx, request); err != nil {
+		if err := input.copyObject(ctx, request); err != nil {
 			return fmt.Errorf("S3 notification record %d: %w", index+1, err)
 		}
 	}
 	return nil
 }
 
-func (input s3Input) readObject(ctx context.Context, request *s3.GetObjectInput) error {
+func (input s3Input) copyObject(ctx context.Context, request *s3.GetObjectInput) error {
 	object, err := input.client.GetObject(ctx, request)
 	if err != nil {
 		return fmt.Errorf("get S3 object: %w", err)
 	}
 	defer object.Body.Close()
-	// 파일 전체를 메모리에 올리지 않고 GZIP을 해제하면서 ingest에 전달한다.
-	stream, err := gzip.NewReader(object.Body)
-	if err != nil {
-		return fmt.Errorf("open gzip object: %w", err)
+	stream := bufio.NewReader(object.Body)
+	// 압축 표식만 확인하고 CronJob에 전달할 GZIP 바이트는 그대로 유지한다.
+	header, err := stream.Peek(3)
+	if err != nil || !bytes.Equal(header, []byte{0x1f, 0x8b, 0x08}) {
+		return errors.New("S3 object is not gzip")
 	}
-	defer stream.Close()
-	return input.ingest(ctx, stream)
+	size := aws.ToInt64(object.ContentLength)
+	if size < 3 {
+		return errors.New("S3 object is missing a valid content length")
+	}
+	// 같은 키가 덮어써졌을 때 이전 객체의 재전달과 구분한다.
+	version := aws.ToString(object.VersionId)
+	if version == "" {
+		version = aws.ToString(request.VersionId)
+	}
+	etag := strings.Trim(aws.ToString(object.ETag), `"`)
+	if version == "" && etag == "" {
+		return errors.New("S3 object is missing both version and ETag")
+	}
+	key := aws.ToString(request.Key)
+	source := strings.Join([]string{input.bucket, key, version, etag}, "\x00")
+	sourceID := fmt.Sprintf("%x", sha256.Sum256([]byte(source)))
+	return input.destination.put(ctx, key, sourceID, stream, size)
 }
