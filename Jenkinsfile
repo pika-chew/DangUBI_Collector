@@ -80,7 +80,8 @@ pipeline {
         // GO_IMAGE는 Dockerfile 빌드 스테이지(golang:1.26-alpine)와 같은 마이너 버전.
         // -race 테스트에 gcc가 필요해서 alpine이 아닌 Debian 기반 이미지를 쓴다
         GO_IMAGE        = 'golang:1.26'
-        GOTESTSUM_PKG   = 'gotest.tools/gotestsum@v1.12.0'               // go test 결과를 JUnit XML로 변환
+        // go test 결과를 JUnit XML로 변환. v1.12.0은 의존성(golang.org/x/tools v0.19.0)이 Go 1.24 이상에서 컴파일되지 않는다
+        GOTESTSUM_PKG   = 'gotest.tools/gotestsum@v1.13.0'
         DOCKER_IMAGE    = 'docker:27.3.1-cli'
         TRIVY_IMAGE     = 'aquasec/trivy:0.58.1'
         GITLEAKS_IMAGE  = 'zricethezav/gitleaks:v8.21.2'
