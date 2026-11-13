@@ -2,10 +2,8 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"sync/atomic"
@@ -19,13 +17,16 @@ import (
 )
 
 const (
+	// 120초 숨김 시간이 끝나기 전에 60초마다 연장한다.
 	visibilitySeconds = 120
 	visibilityRefresh = 60 * time.Second
-	pollWaitSeconds   = 20
-	pollCallTimeout   = 30 * time.Second
-	queueCallTimeout  = 10 * time.Second
+	// SQS가 메시지를 기다리는 시간보다 HTTP 호출 제한을 길게 둔다.
+	pollWaitSeconds  = 20
+	pollCallTimeout  = 30 * time.Second
+	queueCallTimeout = 10 * time.Second
 )
 
+// queueClient는 워커에 필요한 SQS 동작만 정의해 테스트에서 모의 클라이언트를 쓸 수 있게 한다.
 type queueClient interface {
 	ReceiveMessage(context.Context, *sqs.ReceiveMessageInput, ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error)
 	ChangeMessageVisibility(context.Context, *sqs.ChangeMessageVisibilityInput, ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error)
@@ -39,7 +40,7 @@ type queueWorker struct {
 	refresh  time.Duration
 }
 
-func runWorker(ctx context.Context, db *sql.DB) error {
+func runWorker(ctx context.Context) error {
 	queueURL := os.Getenv("COLLECTOR_SQS_QUEUE_URL")
 	bucket := os.Getenv("COLLECTOR_S3_BUCKET")
 	if queueURL == "" || bucket == "" {
@@ -52,29 +53,33 @@ func runWorker(ctx context.Context, db *sql.DB) error {
 	if cfg.Region == "" {
 		return errors.New("set AWS_REGION or configure a region in the AWS profile")
 	}
-	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	err = db.PingContext(pingCtx)
+	// 큐에서 메시지를 받기 전에 Swift 인증과 대상 컨테이너 접근을 확인한다.
+	startupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	destination, err := openSwift(startupCtx)
+	if err != nil {
+		return err
+	}
+	err = destination.check(startupCtx)
 	cancel()
 	if err != nil {
-		return fmt.Errorf("connect to MySQL: %w", err)
+		return err
 	}
 	worker := queueWorker{
 		queue:    sqs.NewFromConfig(cfg),
 		queueURL: queueURL,
 		refresh:  visibilityRefresh,
 		input: s3Input{
-			client: s3.NewFromConfig(cfg),
-			bucket: bucket,
-			ingest: func(ctx context.Context, input io.Reader) error {
-				return ingest(ctx, db, input)
-			},
+			client:      s3.NewFromConfig(cfg),
+			bucket:      bucket,
+			destination: destination,
 		},
 	}
 	healthAddr := os.Getenv("COLLECTOR_HEALTH_ADDR")
 	if healthAddr == "" {
 		healthAddr = ":8080"
 	}
-	return worker.serve(ctx, healthAddr, db.PingContext)
+	return worker.serve(ctx, healthAddr, destination.check)
 }
 
 func (w queueWorker) poll(ctx context.Context, queueReady *atomic.Bool) {
@@ -88,6 +93,7 @@ func (w queueWorker) poll(ctx context.Context, queueReady *atomic.Bool) {
 			VisibilityTimeout:   visibilitySeconds,
 		})
 		cancel()
+		// 메시지가 없는 응답도 수신 요청이 성공했으므로 준비 상태로 본다.
 		queueReady.Store(err == nil && ctx.Err() == nil)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -117,6 +123,7 @@ func (w queueWorker) handle(ctx context.Context, message types.Message) error {
 	}
 	messageCtx, cancelMessage := context.WithCancelCause(ctx)
 	defer cancelMessage(nil)
+	// 객체를 읽고 저장하는 동안 별도 고루틴에서 메시지 숨김 시간을 연장한다.
 	refreshCtx, stopRefresh := context.WithCancel(messageCtx)
 	refreshDone := make(chan struct{})
 	go func() {
@@ -125,6 +132,7 @@ func (w queueWorker) handle(ctx context.Context, message types.Message) error {
 	}()
 
 	err := w.input.process(messageCtx, aws.ToString(message.Body))
+	// 삭제와 숨김 시간 연장 요청이 겹치지 않도록 연장 작업이 끝날 때까지 기다린다.
 	stopRefresh()
 	<-refreshDone
 	if cause := context.Cause(messageCtx); cause != nil {
@@ -134,6 +142,7 @@ func (w queueWorker) handle(ctx context.Context, message types.Message) error {
 		return err
 	}
 
+	// 알림에 포함된 객체를 모두 Swift에 저장한 뒤에만 SQS에서 삭제한다.
 	deleteCtx, cancel := context.WithTimeout(ctx, queueCallTimeout)
 	defer cancel()
 	_, err = w.queue.DeleteMessage(deleteCtx, &sqs.DeleteMessageInput{
@@ -162,6 +171,7 @@ func (w queueWorker) refreshVisibility(ctx context.Context, receiptHandle *strin
 			})
 			cancel()
 			if err != nil && ctx.Err() == nil {
+				// 연장에 실패하면 현재 처리를 취소해 SQS에서 재전달할 수 있게 한다.
 				abort(fmt.Errorf("extend SQS visibility: %w", err))
 				return
 			}

@@ -18,25 +18,28 @@ import (
 )
 
 const objectEvent = `{"eventVersion":"2.1","eventSource":"aws:s3","eventName":"ObjectCreated:Put",
-	"s3":{"bucket":{"name":"test-bucket"},"object":{"key":"firehose%2Fprocessed%2Ftest+file.jsonl.gz","versionId":"v1"}}}`
+	"s3":{"bucket":{"name":"test-bucket"},"object":{"key":"firehose%2Fprocessed%2Fyear%3D2026%2Fday%3D11%2Ftest+file.jsonl.gz","versionId":"v1"}}}`
 
 func TestWorkerDeletesOnlyAfterAllObjectsAreProcessed(t *testing.T) {
+	// 모의 클라이언트로 객체 읽기, 저장, 메시지 삭제의 순서를 확인한다.
 	for _, test := range []struct {
 		name        string
 		body        string
 		failOnWrite int
 		wantActions []string
 	}{
-		{"multiple objects", `{"Records":[` + objectEvent + `,` + objectEvent + `]}`, 0, []string{"get", "commit", "get", "commit", "delete"}},
-		{"partial failure", `{"Records":[` + objectEvent + `,` + objectEvent + `]}`, 2, []string{"get", "commit", "get", "failed write"}},
+		{"multiple objects", `{"Records":[` + objectEvent + `,` + objectEvent + `]}`, 0, []string{"get", "put", "get", "put", "delete"}},
+		{"partial failure", `{"Records":[` + objectEvent + `,` + objectEvent + `]}`, 2, []string{"get", "put", "get", "failed write"}},
 		{"test event", `{"Service":"Amazon S3","Event":"s3:TestEvent","Bucket":"test-bucket"}`, 0, []string{"delete"}},
 		{"unexpected bucket", `{"Records":[` + strings.ReplaceAll(objectEvent, "test-bucket", "other-bucket") + `]}`, 0, nil},
 		{"legacy message", `{"idempotencyKey":"demo-001","vehicleId":"vehicle-001"}`, 0, nil},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			const records = "{\"idempotencyKey\":\"test\"}\n"
+			const objectKey = "firehose/processed/year=2026/day=11/test file.jsonl.gz"
+			compressed := gzipBody(t, "{\"ts\":0}\n")
 			var actions []string
 			writes := 0
+			var savedSourceID string
 			worker := queueWorker{
 				queue:   &testQueue{delete: func() { actions = append(actions, "delete") }},
 				refresh: time.Hour,
@@ -44,24 +47,28 @@ func TestWorkerDeletesOnlyAfterAllObjectsAreProcessed(t *testing.T) {
 					bucket: "test-bucket",
 					client: testObject(func(_ context.Context, request *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
 						actions = append(actions, "get")
-						if aws.ToString(request.Key) != "firehose/processed/test file.jsonl.gz" || aws.ToString(request.VersionId) != "v1" {
+						if aws.ToString(request.Key) != objectKey || aws.ToString(request.VersionId) != "v1" {
 							t.Fatalf("unexpected S3 request: %+v", request)
 						}
-						return &s3.GetObjectOutput{Body: gzipBody(t, records)}, nil
+						return &s3.GetObjectOutput{Body: io.NopCloser(bytes.NewReader(compressed)), ContentLength: aws.Int64(int64(len(compressed)))}, nil
 					}),
-					ingest: func(_ context.Context, stream io.Reader) error {
+					destination: testDestination(func(_ context.Context, key, sourceID string, stream io.Reader, size int64) error {
 						content, err := io.ReadAll(stream)
-						if err != nil || string(content) != records {
-							t.Fatalf("unexpected gzip content: %q, %v", content, err)
+						if err != nil || !bytes.Equal(content, compressed) || key != objectKey || size != int64(len(compressed)) {
+							t.Fatalf("unexpected Swift object %q of size %d, error %v", key, size, err)
 						}
+						if sourceID == "" || (savedSourceID != "" && savedSourceID != sourceID) {
+							t.Fatal("same S3 object must keep the same source ID")
+						}
+						savedSourceID = sourceID
 						writes++
 						if writes == test.failOnWrite {
 							actions = append(actions, "failed write")
-							return errors.New("test database error")
+							return errors.New("test Swift error")
 						}
-						actions = append(actions, "commit")
+						actions = append(actions, "put")
 						return nil
-					},
+					}),
 				},
 			}
 			err := worker.handle(context.Background(), types.Message{Body: aws.String(test.body), ReceiptHandle: aws.String("receipt")})
@@ -91,6 +98,7 @@ func TestWorkerCancelsProcessingWhenVisibilityCannotBeExtended(t *testing.T) {
 		input: s3Input{
 			bucket: "test-bucket",
 			client: testObject(func(ctx context.Context, _ *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
+				// 읽기가 진행 중일 때 연장 실패가 취소 신호로 전달되는지 확인한다.
 				<-ctx.Done()
 				return nil, ctx.Err()
 			}),
@@ -126,7 +134,13 @@ func (f testObject) GetObject(ctx context.Context, request *s3.GetObjectInput, _
 	return f(ctx, request)
 }
 
-func gzipBody(t *testing.T, content string) io.ReadCloser {
+type testDestination func(context.Context, string, string, io.Reader, int64) error
+
+func (f testDestination) put(ctx context.Context, key, sourceID string, body io.Reader, size int64) error {
+	return f(ctx, key, sourceID, body, size)
+}
+
+func gzipBody(t *testing.T, content string) []byte {
 	t.Helper()
 	var compressed bytes.Buffer
 	writer := gzip.NewWriter(&compressed)
@@ -136,5 +150,5 @@ func gzipBody(t *testing.T, content string) io.ReadCloser {
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	return io.NopCloser(&compressed)
+	return compressed.Bytes()
 }

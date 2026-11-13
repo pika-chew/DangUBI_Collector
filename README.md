@@ -1,53 +1,36 @@
 # DangUBI Collector
 
-Go로 만든 Collector입니다. 파일 경로를 주면 로컬 JSONL을 적재하고 종료합니다. `--worker`를 주면 SQS에서 S3 알림을 받아 Firehose의 `.jsonl.gz`를 읽습니다. 두 실행 방식 모두 레코드마다 `collector_events`와 `outbox`를 같은 트랜잭션에 기록합니다. 현재 DB 스키마와 outbox 이벤트는 검증용입니다.
+Collector는 SQS에서 S3 객체 생성 알림을 받고, Firehose가 만든 `.jsonl.gz`를 OpenStack Swift에 보관하는 Go 워커입니다. CronJob은 Swift에 저장된 파일을 읽어 MySQL 적재를 담당합니다.
 
-## Go를 선택한 이유
+## 처리 순서
 
-Collector는 SQS를 폴링하고, S3의 압축 파일을 스트리밍으로 읽고, MySQL에 기록하는 백그라운드 워커입니다. AWS 연결에는 AWS SDK for Go v2를, GZIP·JSON 처리에는 Go 표준 라이브러리를 사용할 수 있습니다. DB 쓰기는 `database/sql`의 트랜잭션으로 두 INSERT와 커밋 경계를 코드에서 확인할 수 있습니다.
+1. `worker.go`의 `poll`이 SQS에서 한 번에 메시지 1건을 받습니다. 롱 폴링은 최대 20초이고, 처리 중 메시지 숨김 시간은 120초로 설정한 뒤 60초마다 연장합니다.
+2. `s3_input.go`의 `process`가 알림에서 S3 객체 키를 URL 디코딩합니다. 설정한 버킷의 `firehose/processed/` 아래 `.jsonl.gz`만 읽으며, 알림에 버전 ID가 있으면 해당 버전을 받습니다. S3 설정 확인용 `s3:TestEvent`는 객체 복사 없이 처리합니다.
+3. `swift.go`가 GZIP 바이트를 그대로 업로드합니다. 날짜 경로와 파일 이름은 S3 객체 키와 같습니다. 예를 들어 S3 키가 `firehose/processed/year=2026/month=11/day=11/example.jsonl.gz`면, 설정한 Swift 컨테이너 안에도 이 이름으로 저장합니다. 다운로드한 파일을 CronJob에서 압축 해제할 수 있도록 객체의 Content-Type을 `application/gzip`으로 설정합니다.
+4. 같은 Swift 객체 이름이 이미 있으면 S3 원본 식별자, 길이, 내용의 ETag를 비교합니다. 모두 일치하면 재전달로 처리합니다. 기존 파일과 다르거나 업로드에 실패하면 오류를 반환해 SQS 메시지를 남깁니다. 알림에 포함된 객체가 모두 저장됐을 때 SQS 메시지를 삭제합니다.
 
-실행 파일 하나로 컨테이너에 담을 수 있고, `linux/amd64`와 `linux/arm64`용 빌드도 같은 Dockerfile로 만들 수 있습니다.
+## 테스트 큐에서 실행
 
-## 로컬 실행
+Go 1.25 이상, 테스트용 SQS 큐와 S3 버킷, 이미 만들어 둔 Swift 컨테이너가 필요합니다. AWS는 SDK 기본 자격 증명 체인을 사용하고, Swift는 Keystone v3 Application Credential로 인증합니다.
 
-Go 1.25 이상과 로컬 MySQL이 필요합니다. 기존 운영 데이터와 분리된 `collector_dev` DB와 해당 DB에 접근 가능한 로컬 계정을 준비합니다.
-
-```sh
-mysql -h 127.0.0.1 -u collector -p collector_dev < schema.sql
-export COLLECTOR_MYSQL_DSN='collector:local-password@tcp(127.0.0.1:3306)/collector_dev'
-go run . sample.jsonl
-go run . sample.jsonl
-```
-
-빈 DB에서 같은 파일을 두 번 실행한 뒤 아래 두 쿼리는 각각 `1`을 반환합니다.
-
-```sql
-SELECT COUNT(*) FROM collector_events;
-SELECT COUNT(*) FROM outbox;
-```
-
-## 코드 읽는 순서
-
-1. `main.go`의 `ingest`가 JSONL을 한 줄씩 읽고 `parseRecord`가 샘플 형식을 검사합니다. 빈 줄은 건너뛰고 한 줄은 1 MiB 미만이어야 합니다.
-2. `store.go`의 `saveRecord`가 레코드마다 트랜잭션을 엽니다. `idempotencyKey`가 이미 기록됐다면 건너뜁니다. 새 레코드는 두 INSERT가 성공한 뒤에 커밋합니다.
-3. 오류가 발생하면 그 줄에서 멈추고 현재 트랜잭션을 롤백합니다. 이전 줄은 이미 커밋됐으므로 같은 파일로 다시 실행할 수 있습니다.
-
-`schema.sql`과 `collector_demo` 이벤트는 로컬 검증용입니다.
-
-## 테스트 큐에서 워커 실행
-
-테스트용 SQS 큐, 가공 S3 버킷, `schema.sql`을 적용한 테스트 DB를 준비합니다. `AWS_REGION` 또는 AWS 프로필에서 리전을 설정합니다. AWS SDK 기본 자격 증명 체인을 사용합니다.
+| 환경 변수 | 용도 |
+|---|---|
+| `COLLECTOR_SQS_QUEUE_URL`, `COLLECTOR_S3_BUCKET` | 테스트 큐 URL과 원본 버킷 이름 |
+| `AWS_REGION` | AWS 리전. AWS 프로필에서도 지정 가능 |
+| `COLLECTOR_SWIFT_CONTAINER` | 대상 Swift 컨테이너 이름 |
+| `OS_AUTH_URL` | Keystone v3 인증 URL |
+| `OS_APPLICATION_CREDENTIAL_ID`, `OS_APPLICATION_CREDENTIAL_SECRET` | Swift 접근 권한이 있는 Application Credential. Pod에서는 Secret으로 전달 |
+| `OS_REGION_NAME`, `OS_INTERFACE` | Swift 서비스 카탈로그의 리전과 인터페이스. 인터페이스 기본값은 `public` |
+| `COLLECTOR_HEALTH_ADDR` | 헬스 체크 주소. 기본값은 `:8080` |
+| `TMPDIR` | 업로드용 임시 디렉터리. Linux 컨테이너 기본값은 `/tmp` |
 
 ```sh
-export COLLECTOR_SQS_QUEUE_URL='https://sqs.ap-northeast-2.amazonaws.com/123456789012/collector-test'
-export COLLECTOR_S3_BUCKET='collector-test-processed'
-export AWS_REGION='ap-northeast-2'
 go run . --worker
 ```
 
-- SQS 메시지는 S3 `ObjectCreated` 알림 형식입니다. 워커는 설정한 버킷의 `firehose/processed/*.jsonl.gz`만 읽으며 알림에 객체 버전이 있으면 해당 버전으로 읽습니다. 같은 버킷의 `s3:TestEvent`는 DB에 쓰지 않고 처리합니다. 기존 Lambda가 SQS에 직접 보낸 차량 JSON은 지원 대상이 아니므로 전환할 때는 기존 적체를 먼저 처리합니다.
-- GZIP 안의 각 JSONL 레코드는 `sample.jsonl`과 같은 형식이며 재전달 때도 `idempotencyKey`가 같아야 합니다. 하나의 알림에 포함된 모든 객체를 읽고 모든 DB 트랜잭션이 끝난 뒤 SQS 메시지를 삭제합니다. 일부만 커밋된 상태에서 다시 받으면 이미 저장된 레코드는 건너뜁니다.
-- 워커는 한 번에 메시지 1건을 받아 최대 20초 동안 롱 폴링합니다. 처리 중 메시지 숨김 시간은 120초이며 60초마다 연장합니다. 읽기·저장·연장에 실패하거나 종료 신호를 받으면 처리를 중단하고 SQS 재전달로 복구합니다.
+SQS에 `ReceiveMessage`, `DeleteMessage`, `ChangeMessageVisibility` 권한이 필요합니다. S3 객체에는 `GetObject` 또는 버전 조회 시 `GetObjectVersion` 권한이 필요합니다. Swift 자격 증명에는 대상 컨테이너와 객체의 HEAD 조회 및 객체 PUT 권한이 필요합니다.
+
+테스트 버킷의 `firehose/processed/` 아래에 GZIP 파일을 올려 SQS 알림을 보냅니다. 샘플 파일은 `gzip -c sample.jsonl > example.jsonl.gz`로 만들 수 있습니다. Swift에 같은 키가 생기고 파일 바이트가 일치하는지 확인합니다.
 
 ## Docker 이미지 빌드 및 GHCR 게시
 
@@ -69,18 +52,11 @@ docker buildx imagetools inspect "$IMAGE"
 docker buildx create --name collector-builder --driver docker-container
 ```
 
-`0.1.0-local.1`은 검증용 예시 태그입니다. 컨테이너에서 워커를 실행하려면 `--worker`와 큐·버킷 설정을 전달합니다. 파일 적재를 실행하려면 JSONL을 마운트하고 입력 경로를 전달합니다. DB 연결은 두 모드 모두 `COLLECTOR_MYSQL_DSN` 또는 아래 네 환경 변수로 설정할 수 있습니다. DSN이 있으면 우선 사용합니다.
+`0.1.0-local.1`은 검증용 예시 태그입니다. 컨테이너를 실행할 때 인자로 `--worker`를 전달합니다.
 
-## Kubernetes 통합 검증
+## Kubernetes 헬스 체크
 
-테스트 배포에서는 컨테이너 인자를 `--worker`로 설정합니다. 운영 배포 전에는 실제 큐 메시지 형식과 레코드 고유 키, 운영 테이블과 outbox 이벤트 계약을 확인합니다.
-
-Deployment에는 큐 URL과 버킷을 지정하고 `sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:ChangeMessageVisibility`, `s3:GetObject`, `s3:GetObjectVersion` 권한을 부여합니다.
-
-- ConfigMap의 `COLLECTOR_MYSQL_ADDRESS`에는 MySQL Router 쓰기 주소 `mysql-router.dangubi-data.svc.cluster.local:3306`을, `COLLECTOR_MYSQL_DATABASE`에는 사용할 DB 이름을 지정합니다.
-- `COLLECTOR_MYSQL_USER`와 `COLLECTOR_MYSQL_PASSWORD`는 `collector-mysql-cred` Secret의 `username`과 `password` 키에서 가져옵니다. TLS 등 추가 드라이버 설정이 필요한 환경에서는 DSN을 Secret으로 전달합니다.
-
-워커의 헬스 체크는 기본 포트 `8080`에서 응답합니다. `COLLECTOR_HEALTH_ADDR`로 주소를 바꿀 수 있습니다. GitOps의 Spring Actuator 경로 대신 아래 설정을 컨테이너에 적용합니다.
+`/livez`는 HTTP 서버가 응답하면 `200`을 반환합니다. `/readyz`는 최근 SQS 수신 요청과 Swift 컨테이너 조회가 성공했을 때 `200`을, 그 외에는 `503`을 반환합니다. 시작 시에도 Swift에 인증하고 컨테이너에 접근할 수 있는지 확인합니다.
 
 ```yaml
 args: ["--worker"]
@@ -104,6 +80,4 @@ readinessProbe:
   timeoutSeconds: 3
 ```
 
-`/livez`는 HTTP 서버가 응답하면 `200`을 반환합니다. `/readyz`는 최근 SQS 수신 요청과 MySQL ping이 성공했을 때 `200`을, 그 외에는 `503`을 반환합니다. 빈 큐에서 수신 요청이 정상 종료돼도 성공입니다. S3 읽기 권한과 실제 적재는 테스트 이벤트로 확인합니다.
-
-그다음 새 고유 키로 테스트 입력을 한 건 보내 Pod 로그에서 수신과 처리를 확인하고, 그 키로 업무 테이블과 outbox를 조회합니다. SQS 메시지는 DB 커밋이 끝난 뒤 삭제되는지 확인합니다.
+워커는 한 번에 한 객체를 디스크에 임시 저장하고 업로드가 끝나면 파일을 정리합니다. 컨테이너 루트 파일시스템을 읽기 전용으로 쓰는 경우 `/tmp` 또는 `TMPDIR`에 쓰기 가능한 볼륨을 마운트합니다.
