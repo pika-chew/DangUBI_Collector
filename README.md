@@ -32,6 +32,35 @@ SQS에 `ReceiveMessage`, `DeleteMessage`, `ChangeMessageVisibility` 권한이 �
 
 테스트 버킷의 `firehose/processed/` 아래에 GZIP 파일을 올려 SQS 알림을 보냅니다. 샘플 파일은 `gzip -c sample.jsonl > example.jsonl.gz`로 만들 수 있습니다. Swift에 같은 키가 생기고 파일 바이트가 일치하는지 확인합니다.
 
+## Collector 장애 테스트용 재발행
+
+Python 3와 AWS CLI v2가 필요합니다. AWS 프로필에 원본 버킷의 `s3:ListBucketVersions`와 테스트 큐의 `sqs:SendMessage` 권한을 부여합니다. Collector의 `COLLECTOR_SQS_QUEUE_URL`과 `COLLECTOR_S3_BUCKET`을 각각 테스트용 Standard 큐와 원본 버킷에 맞춥니다.
+
+1. 시뮬레이터 입력이 S3에 도착한 뒤 테스트 대상 UTC 경로의 파일 목록을 한 번 저장합니다. `REPLAY_BUCKET`은 원본 버킷이고 `REPLAY_QUEUE_URL`은 테스트 큐의 전체 URL입니다.
+
+   ```sh
+   python3 scripts/replay_sqs.py snapshot \
+     --bucket "$REPLAY_BUCKET" \
+     --prefix firehose/processed/year=2026/month=11/day=25/ \
+     --manifest replay-manifest.json
+   ```
+
+2. 새 테스트마다 빈 큐와 빈 Swift 컨테이너를 준비합니다. 같은 큐를 재사용할 경우 이전 실행의 대기 중·처리 중 메시지까지 모두 정리됐는지 확인합니다. Collector는 Swift에 같은 키와 내용의 파일이 있으면 재전달로 처리하므로, 새 컨테이너를 쓰면 매회 실제 쓰기 부하를 줄 수 있습니다.
+
+3. 같은 manifest로 전송합니다. 아래 명령에 `--dry-run`을 붙이면 AWS 호출 없이 건수와 원본 바이트 수를 확인할 수 있습니다.
+
+   ```sh
+   python3 scripts/replay_sqs.py publish \
+     --manifest replay-manifest.json \
+     --queue-url "$REPLAY_QUEUE_URL"
+   ```
+
+파일당 S3 객체 생성 알림 한 건을 최대 10건씩 보냅니다. 전송이 모두 확인되면 `SQS accepted N/N messages`를 출력합니다. 실제 수신 순서와 중복·재수신은 Standard 큐 동작을 따릅니다. 전송 실패나 부분 성공이 발생하면 확인된 건수를 표시하고 멈춥니다. 같은 큐에 전량을 다시 보내면 앞서 들어간 알림이 중복될 수 있습니다.
+
+Manifest는 객체 키·버전 ID·ETag·크기를 보관합니다. Collector는 버전 ID가 있으면 해당 버전을 읽고, 버전 ID가 없으면 ETag를 대조합니다. 장기간 보관이 필요하면 원본의 S3 수명 주기 만료 전에 테스트 버킷에 파일을 보관한 뒤 그 버킷에서 manifest를 만듭니다.
+
+Swift 저장까지 검증하려면 manifest의 객체 키와 실제 Swift 객체 키를 비교합니다. Swift 이후 CronJob·MySQL·Kafka·MongoDB·Query 테스트에서는 검증한 Swift 파일 세트를 그대로 재사용할 수 있습니다.
+
 ## Docker 이미지 빌드 및 GHCR 게시
 
 `DangUBI_Collector` 디렉터리에서 Docker가 실행 중인지 확인합니다. 로컬에서 게시하려면 `pika-chew` 조직에 패키지를 게시할 권한이 있는 GitHub 계정과 `write:packages` 범위의 PAT(classic)이 필요합니다. 조직이 SSO를 사용하면 토큰에도 해당 조직의 SSO를 승인합니다. `GHCR_USER`와 `GHCR_TOKEN`은 셸 환경에서 설정합니다. [GHCR 인증 및 게시](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)
