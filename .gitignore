@@ -13,3 +13,6 @@ Thumbs.db
 .env.*
 !.env.example
 !.env.*.example
+
+# Local SQS replay snapshot
+/replay-manifest.json
